@@ -361,7 +361,8 @@ static void usage()
         "pns-route — headless KiCad push-and-shove router\n"
         "Usage: pns-route board.kicad_pcb --net <net> --from <REF.PAD> --to <REF.PAD>\n"
         "                 --layer <LayerName> [--iter-limit N] [--mode shove|walkaround]\n"
-        "                 [--width-mm W] [--clearance-mm C] [-o out.kicad_pcb]\n" );
+        "                 [--waypoints \"x,y;x,y;...\" (mm)] [--width-mm W]\n"
+        "                 [--clearance-mm C] [-o out.kicad_pcb]\n" );
 }
 
 
@@ -376,6 +377,7 @@ int main( int argc, char** argv )
     }
 
     std::string boardPath, outPath, netName, fromRef, toRef, layerName, modeStr = "shove";
+    std::string waypointStr;
     int iterLimit = 0;
     double widthMM = 0.0, clearanceMM = 0.0;
 
@@ -398,6 +400,7 @@ int main( int argc, char** argv )
         else if( a == "--width-mm" )  widthMM = std::stod( next() );
         else if( a == "--clearance-mm" ) clearanceMM = std::stod( next() );
         else if( a == "--mode" )      modeStr = next();
+        else if( a == "--waypoints" ) waypointStr = next();
         else if( a == "-o" || a == "--out" ) outPath = next();
         else if( a == "-h" || a == "--help" ) { usage(); return 0; }
         else if( boardPath.empty() && a[0] != '-' ) boardPath = a;
@@ -508,12 +511,44 @@ int main( int argc, char** argv )
 
     PNS::ITEM* endItem = pickItem( &router, &iface, toPad, endPos, net, pnsLayer );
 
-    // --- Route with shove ------------------------------------------------
-    // The interactive engine places a "head" toward the cursor on each Move;
-    // a single Move rarely threads a whole congested path. So we drive it like
-    // the GUI user does: repeated Move steps toward the target, letting the
-    // head advance / shove, then FixRoute to commit. We stop early when the
-    // head reaches the target (CurrentEnd within one track width).
+    // --- Build the hop list: waypoints (mm, board coords) then the target ---
+    // The interactive engine places one "head" toward the cursor; a single
+    // straight Move-to-target stalls against obstacles it can't shove past in
+    // that direction. A coarse global planner supplies waypoints that steer the
+    // head around FIXED copper while trusting PNS to shove MOVEABLE traces. We
+    // drive each hop like the GUI user's per-corner click: Move to settle, then
+    // FixRoute(hop, forceFinish=false) to lock the leader and continue.
+    std::vector<VECTOR2I> hops;
+
+    if( !waypointStr.empty() )
+    {
+        // Format: "x,y;x,y;..." in mm (board coordinates).
+        std::string s = waypointStr;
+        size_t pos = 0;
+
+        while( pos < s.size() )
+        {
+            size_t semi = s.find( ';', pos );
+            std::string tok = s.substr( pos, semi == std::string::npos ? std::string::npos : semi - pos );
+            size_t comma = tok.find( ',' );
+
+            if( comma != std::string::npos )
+            {
+                double mx = std::stod( tok.substr( 0, comma ) );
+                double my = std::stod( tok.substr( comma + 1 ) );
+                hops.emplace_back( static_cast<int>( mx * 1e6 ), static_cast<int>( my * 1e6 ) );
+            }
+
+            if( semi == std::string::npos )
+                break;
+
+            pos = semi + 1;
+        }
+    }
+
+    hops.push_back( endPos );   // final hop is always the destination pad
+
+    // --- Route with shove, hop by hop -----------------------------------
     if( !router.StartRouting( startPos, startItem, pnsLayer ) )
     {
         fprintf( stderr, "pns-route: StartRouting failed: %s\n",
@@ -522,50 +557,84 @@ int main( int argc, char** argv )
     }
 
     const int reachTol = std::max( 1, sizes.TrackWidth() );   // "arrived" tolerance
-    int  moveSteps = 0;
-    bool reached = false;
+    int  totalMoves = 0;
+    int  stalledHop = -1;                                     // -1 == none
+    VECTOR2I stallPos;
+    bool allHopsReached = true;
 
-    for( int step = 0; step < 64; ++step )
+    for( size_t h = 0; h < hops.size() && router.RoutingInProgress(); ++h )
     {
-        router.Move( endPos, endItem );
-        moveSteps++;
+        const VECTOR2I&   hop = hops[h];
+        const bool        isLast = ( h + 1 == hops.size() );
+        PNS::ITEM*        hopEnd = isLast ? endItem : nullptr;
+        bool              hopReached = false;
+        VECTOR2I          lastHead;
 
-        if( !router.RoutingInProgress() )
-            break;
-
-        if( PNS::PLACEMENT_ALGO* placer = router.Placer() )
+        // Advance the head toward this hop until it arrives or stops moving.
+        for( int step = 0; step < 48 && router.RoutingInProgress(); ++step )
         {
+            router.Move( hop, hopEnd );
+            totalMoves++;
+
+            PNS::PLACEMENT_ALGO* placer = router.Placer();
+
+            if( !placer )
+                break;
+
             VECTOR2I head = placer->CurrentEnd();
 
-            if( ( head - endPos ).EuclideanNorm() <= reachTol )
+            if( ( head - hop ).EuclideanNorm() <= reachTol )
             {
-                reached = true;
+                hopReached = true;
                 break;
             }
+
+            // Detect a stuck head: no progress across two consecutive moves.
+            if( step > 0 && ( head - lastHead ).EuclideanNorm() <= reachTol )
+                break;
+
+            lastHead = head;
+        }
+
+        // Lock the leader up to this hop and keep routing (forceFinish only on
+        // the final hop so the whole trace commits to the destination pad).
+        if( router.RoutingInProgress() )
+            router.FixRoute( hop, hopEnd, /*forceFinish*/ isLast, /*forceCommit*/ isLast );
+
+        if( !hopReached )
+        {
+            allHopsReached = false;
+            stalledHop = static_cast<int>( h );
+            stallPos = router.Placer() ? router.Placer()->CurrentEnd() : startPos;
+            break;
         }
     }
 
-    bool fixOk = router.RoutingInProgress()
-                     && router.FixRoute( endPos, endItem, /*forceFinish*/ true, /*forceCommit*/ true );
+    bool reached = allHopsReached;
 
     router.CommitRouting();
 
-    // Honest success gate: copper must have actually been laid AND the head
-    // must have reached the target pad.  FixRoute alone can return true while
-    // placing nothing, so we do not trust it by itself.
-    bool completed = fixOk && reached && iface.Added() > 0;
+    // Honest success gate: copper actually laid AND every hop (incl. target)
+    // reached. FixRoute alone can return true while placing nothing.
+    bool completed = reached && iface.Added() > 0;
 
-    printf( "pns-route: mode=%s from=%s to=%s layer=%s -> completed=%s "
-            "(reached=%s fix=%s moves=%d added=%d removed=%d updated=%d)\n",
-            modeStr.c_str(), fromRef.c_str(), toRef.c_str(), layerName.c_str(),
-            completed ? "yes" : "no", reached ? "yes" : "no", fixOk ? "yes" : "no",
-            moveSteps, iface.Added(), iface.Removed(), iface.Updated() );
+    printf( "pns-route: mode=%s net=%s from=%s to=%s layer=%s -> completed=%s "
+            "(reached=%s hops=%zu moves=%d added=%d removed=%d updated=%d)\n",
+            modeStr.c_str(), netName.c_str(), fromRef.c_str(), toRef.c_str(), layerName.c_str(),
+            completed ? "yes" : "no", reached ? "yes" : "no", hops.size(),
+            totalMoves, iface.Added(), iface.Removed(), iface.Updated() );
 
     if( !completed )
     {
-        fprintf( stderr, "pns-route: connection NOT completed (%s)\n",
-                 router.FailureReason().IsEmpty() ? "head did not reach target / no copper laid"
-                                                   : router.FailureReason().ToUTF8().data() );
+        if( stalledHop >= 0 )
+            fprintf( stderr, "pns-route: STALLED at hop %d/%zu near (%.3f, %.3f) mm — %s\n",
+                     stalledHop + 1, hops.size(),
+                     stallPos.x / 1e6, stallPos.y / 1e6,
+                     ( stalledHop + 1 == static_cast<int>( hops.size() ) )
+                         ? "head could not reach target pad"
+                         : "head boxed in before reaching waypoint (fixed geometry or bad coarse path)" );
+        else
+            fprintf( stderr, "pns-route: connection NOT completed (no copper laid)\n" );
     }
 
     bool fixed = completed;
