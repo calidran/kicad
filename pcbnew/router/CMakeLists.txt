@@ -156,19 +156,25 @@ if( KICAD_BUILD_PNS_HEADLESS )
         ${CMAKE_SOURCE_DIR}/libs/kimath/include
     )
 
+    # pcbnew_kiface_objects supplies Kiface(), the tool framework (PCB_TOOL_BASE /
+    # PCB_SELECTION_TOOL) and the board-model glue that pcbcommon/pnsrouter
+    # reference; the IO plugin libs supply the self-registering PCB_IO backends
+    # (sexpr load/save + siblings). Order-independent target names.
     target_link_libraries( pns-route
+        pcbnew_kiface_objects
         connectivity
         pcbcommon
         pnsrouter
+        3d-viewer
+        kicommon
         gal
         common
-        pcbcommon
+        core
+        idf3
+        markdown_lib
         dxflib_qcad
         tinyspline_lib
         nanosvg
-        idf3
-        markdown_lib
-        3d-viewer
         ${PCBNEW_IO_LIBRARIES}
         ${wxWidgets_LIBRARIES}
         ${GDI_PLUS_LIBRARIES}

@@ -21,8 +21,8 @@
  * How it stays headless (verified against source, 2026-07-24):
  *   PNS has two ifaces.  PNS_KICAD_IFACE (derived) owns the VIEW / PCB_TOOL_BASE
  *   / BOARD_COMMIT — that is the GUI coupling.  PNS_KICAD_IFACE_BASE (its base)
- *   is already headless: it holds only BOARD* + PNS::NODE*, all Display*/Hide
- *   hooks are no-ops, and SyncWorld()/syncPad/syncTrack/syncVia build the NODE
+ *   is already headless: it holds only BOARD* + PNS::NODE*, all Display and
+ *   Hide hooks are no-ops, and SyncWorld/syncPad/syncTrack/syncVia build the NODE
  *   straight from the BOARD.  Its AddItem/RemoveItem/UpdateItem/Commit are empty
  *   stubs (the derived class does the board write via a BOARD_COMMIT).
  *
@@ -65,7 +65,31 @@
 #include <router/pns_itemset.h>
 #include <router/pns_solid.h>
 #include <router/pns_segment.h>
+#include <router/pns_arc.h>
 #include <router/pns_via.h>
+
+#include <kiface_base.h>
+#include <kiway.h>
+
+
+// ---------------------------------------------------------------------------
+// Minimal KIFACE stub.  pcbnew_kiface_objects references the global Kiface()
+// accessor (normally provided by the pcbnew kiface DSO). For a headless CLI we
+// supply a do-nothing KIFACE_BASE, exactly as KiCad's own QA harness does
+// (qa/qa_utils/test_app_main.cpp).
+// ---------------------------------------------------------------------------
+static struct HEADLESS_KIFACE : public KIFACE_BASE
+{
+    HEADLESS_KIFACE( const char* aName, KIWAY::FACE_T aType ) : KIFACE_BASE( aName, aType ) {}
+
+    bool OnKifaceStart( PGM_BASE*, int, KIWAY* ) override { return true; }
+    void OnKifaceEnd() override {}
+    wxWindow* CreateKiWindow( wxWindow*, int, KIWAY*, int = 0 ) override { return nullptr; }
+    void* IfaceOrAddress( int ) override { return nullptr; }
+}
+g_headlessKiface( "pns_route", KIWAY::FACE_PCB );
+
+KIFACE_BASE& Kiface() { return g_headlessKiface; }
 
 
 // ---------------------------------------------------------------------------
