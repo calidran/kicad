@@ -129,3 +129,50 @@ target_link_libraries( pnsrouter PRIVATE
 target_link_libraries( pnsrouter_qa PRIVATE
     common
 )
+
+# ---------------------------------------------------------------------------
+# Headless PNS CLI (calidran/kicad headless-pns spike).
+# Standalone `pns-route` executable that drives push-and-shove with no GUI.
+# Gated behind KICAD_BUILD_PNS_HEADLESS so a normal build is unaffected.
+# Links the same backend set as qa/tools/pns (the proven headless PNS link
+# recipe), minus the boost unit-test framework.
+# ---------------------------------------------------------------------------
+option( KICAD_BUILD_PNS_HEADLESS "Build the headless pns-route CLI" OFF )
+
+if( KICAD_BUILD_PNS_HEADLESS )
+    add_executable( pns-route
+        pns_headless/pns_route_cli.cpp
+    )
+
+    target_compile_definitions( pns-route PRIVATE PCBNEW )
+
+    add_dependencies( pns-route pcbnew )
+
+    target_include_directories( pns-route PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/pcbnew
+        ${CMAKE_SOURCE_DIR}/pcbnew/router
+        ${CMAKE_SOURCE_DIR}/libs/kimath/include
+    )
+
+    target_link_libraries( pns-route
+        connectivity
+        pcbcommon
+        pnsrouter
+        gal
+        common
+        pcbcommon
+        dxflib_qcad
+        tinyspline_lib
+        nanosvg
+        idf3
+        markdown_lib
+        3d-viewer
+        ${PCBNEW_IO_LIBRARIES}
+        ${wxWidgets_LIBRARIES}
+        ${GDI_PLUS_LIBRARIES}
+        Boost::headers
+        ${PCBNEW_EXTRA_LIBS}
+    )
+endif()
