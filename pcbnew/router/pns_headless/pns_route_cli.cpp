@@ -67,6 +67,7 @@
 #include <router/pns_segment.h>
 #include <router/pns_arc.h>
 #include <router/pns_via.h>
+#include <router/pns_placement_algo.h>
 
 #include <kiface_base.h>
 #include <kiway.h>
@@ -507,7 +508,12 @@ int main( int argc, char** argv )
 
     PNS::ITEM* endItem = pickItem( &router, &iface, toPad, endPos, net, pnsLayer );
 
-    // --- Route with shove: StartRouting(source) -> Move -> FixRoute(target) ---
+    // --- Route with shove ------------------------------------------------
+    // The interactive engine places a "head" toward the cursor on each Move;
+    // a single Move rarely threads a whole congested path. So we drive it like
+    // the GUI user does: repeated Move steps toward the target, letting the
+    // head advance / shove, then FixRoute to commit. We stop early when the
+    // head reaches the target (CurrentEnd within one track width).
     if( !router.StartRouting( startPos, startItem, pnsLayer ) )
     {
         fprintf( stderr, "pns-route: StartRouting failed: %s\n",
@@ -515,22 +521,54 @@ int main( int argc, char** argv )
         return 3;
     }
 
-    router.Move( endPos, endItem );
+    const int reachTol = std::max( 1, sizes.TrackWidth() );   // "arrived" tolerance
+    int  moveSteps = 0;
+    bool reached = false;
 
-    bool fixed = router.FixRoute( endPos, endItem, /*forceFinish*/ true, /*forceCommit*/ true );
+    for( int step = 0; step < 64; ++step )
+    {
+        router.Move( endPos, endItem );
+        moveSteps++;
+
+        if( !router.RoutingInProgress() )
+            break;
+
+        if( PNS::PLACEMENT_ALGO* placer = router.Placer() )
+        {
+            VECTOR2I head = placer->CurrentEnd();
+
+            if( ( head - endPos ).EuclideanNorm() <= reachTol )
+            {
+                reached = true;
+                break;
+            }
+        }
+    }
+
+    bool fixOk = router.RoutingInProgress()
+                     && router.FixRoute( endPos, endItem, /*forceFinish*/ true, /*forceCommit*/ true );
 
     router.CommitRouting();
 
-    printf( "pns-route: mode=%s from=%s to=%s layer=%s -> fixed=%s (added=%d removed=%d updated=%d)\n",
-            modeStr.c_str(), fromRef.c_str(), toRef.c_str(), layerName.c_str(),
-            fixed ? "yes" : "no", iface.Added(), iface.Removed(), iface.Updated() );
+    // Honest success gate: copper must have actually been laid AND the head
+    // must have reached the target pad.  FixRoute alone can return true while
+    // placing nothing, so we do not trust it by itself.
+    bool completed = fixOk && reached && iface.Added() > 0;
 
-    if( !fixed )
+    printf( "pns-route: mode=%s from=%s to=%s layer=%s -> completed=%s "
+            "(reached=%s fix=%s moves=%d added=%d removed=%d updated=%d)\n",
+            modeStr.c_str(), fromRef.c_str(), toRef.c_str(), layerName.c_str(),
+            completed ? "yes" : "no", reached ? "yes" : "no", fixOk ? "yes" : "no",
+            moveSteps, iface.Added(), iface.Removed(), iface.Updated() );
+
+    if( !completed )
     {
-        fprintf( stderr, "pns-route: FixRoute did not complete the connection: %s\n",
-                 router.FailureReason().ToUTF8().data() );
-        // still save — partial shove state may be useful — but signal failure.
+        fprintf( stderr, "pns-route: connection NOT completed (%s)\n",
+                 router.FailureReason().IsEmpty() ? "head did not reach target / no copper laid"
+                                                   : router.FailureReason().ToUTF8().data() );
     }
+
+    bool fixed = completed;
 
     // --- Save board ------------------------------------------------------
     try
