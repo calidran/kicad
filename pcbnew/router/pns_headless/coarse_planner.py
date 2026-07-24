@@ -189,7 +189,7 @@ def extract(txt, layer, own_net=None):
 # grid A*
 # --------------------------------------------------------------------------
 def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm,
-         dp_mult=1.5, max_hop_mm=0.6):
+         dp_mult=1.5, max_hop_mm=0.6, penalties=None):
     xs = [start[0], goal[0]] + [o[0] for o in fixed]
     ys = [start[1], goal[1]] + [o[1] for o in fixed]
     minx, maxx = min(xs) - margin_mm, max(xs) + margin_mm
@@ -218,16 +218,65 @@ def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm,
                     blocked[cx][cy] = True
 
     # trace-overlap cost map (shoving a foreign-net trace costs, but is allowed)
+    #
+    # PINNED-TRACE RULE (root cause of the A7-class wedges): shove TRANSLATES a
+    # resident trace sideways; it cannot re-topologise it to the other side of a
+    # via. A trace hugging a fixed obstacle inside a capacity-1 gap therefore
+    # cannot make room for us — it is effectively FIXED copper. Charge such
+    # samples a pinned cost far above the normal shove cost so A* routes around
+    # capacity-1 pinches instead of sending PNS into an unshovable wall.
+    TRACK_W = 0.2      # our trace width (board default for these nets)
+    PIN_COST = 12.0
     trace_cost = [[0.0] * ny for _ in range(nx)]
+
+    def pinned(px, py, resident_halfw):
+        # no lateral slack: resident edge to fixed-copper edge < our corridor
+        need = clearance_mm + TRACK_W + clearance_mm
+        for (ox, oy, orad) in fixed:
+            d = math.hypot(px - ox, py - oy) - orad - resident_halfw
+            if d < need:
+                return True
+        return False
+
+    def paint(px, py, radius, amount):
+        # deposit cost over the trace's real footprint, not just its centreline
+        # (a 0.4 mm strap spans ~7 cells at 0.06 — A* must not slip past one
+        # cell off-centre and pay nothing for copper it physically hits)
+        c0x, c0y = to_cell(px - radius, py - radius)
+        c1x, c1y = to_cell(px + radius, py + radius)
+        for cx in range(c0x, c1x + 1):
+            for cy in range(c0y, c1y + 1):
+                qx, qy = to_xy(cx, cy)
+                if (qx - px) ** 2 + (qy - py) ** 2 <= radius * radius:
+                    trace_cost[cx][cy] = max(trace_cost[cx][cy], amount)
+
     for (x1, y1, x2, y2, w, tnet) in traces:
         if tnet == net:
             continue  # our own copper is free
+        halfw = w / 2.0
         steps = max(1, int(math.hypot(x2 - x1, y2 - y1) / (cell_mm * 0.5)))
         for k in range(steps + 1):
             t = k / steps
             px, py = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
-            cx, cy = to_cell(px, py)
-            trace_cost[cx][cy] += 1.0
+            if pinned(px, py, halfw):
+                # pinned copper blocks our whole corridor around it
+                paint(px, py, halfw + TRACK_W / 2.0 + clearance_mm, PIN_COST)
+            else:
+                paint(px, py, halfw, 1.0)
+
+    # PathFinder-style congestion history: penalty circles from prior wedges.
+    # A region that repeatedly caused rips gets progressively more expensive so
+    # later iterations route AROUND chronic pinches instead of re-fighting them.
+    hist_cost = [[0.0] * ny for _ in range(nx)]
+    for p in ( penalties or [] ):
+        px0, py0, pr, pc = p['x'], p['y'], p['r'], p['cost']
+        cx0, cy0 = to_cell(px0 - pr, py0 - pr)
+        cx1, cy1 = to_cell(px0 + pr, py0 + pr)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                qx, qy = to_xy(cx, cy)
+                if (qx - px0) ** 2 + (qy - py0) ** 2 <= pr * pr:
+                    hist_cost[cx][cy] += pc
 
     # ensure start/goal cells are usable even if inside inflated pad copper
     sc, gc = to_cell(*start), to_cell(*goal)
@@ -258,6 +307,8 @@ def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm,
             step = math.hypot(dx, dy)
             # shove penalty: crossing foreign trace copper is allowed but costs
             step += trace_cost[ncx][ncy] * 0.6
+            # congestion history penalty (chronic pinch avoidance)
+            step += hist_cost[ncx][ncy]
             ng = g + step
             if ng < gscore.get((ncx, ncy), 1e18):
                 gscore[(ncx, ncy)] = ng
@@ -325,8 +376,16 @@ def main():
                     help='Douglas-Peucker epsilon = cell_mm * dp_mult (lower = more corners)')
     ap.add_argument('--max-hop-mm', type=float, default=0.6,
                     help='resample so no waypoint hop is longer than this')
+    ap.add_argument('--penalty-file', default=None,
+                    help='JSON list of {x,y,r,cost} congestion-history penalty circles')
     ap.add_argument('--emit', choices=['waypoints', 'debug'], default='waypoints')
     args = ap.parse_args()
+
+    penalties = None
+    if args.penalty_file:
+        import json
+        with open(args.penalty_file) as fh:
+            penalties = json.load(fh)
 
     txt = open(args.board).read()
     fixed, traces, pads = extract(txt, args.layer, own_net=args.net)
@@ -338,7 +397,8 @@ def main():
     start, goal = pads[args.src], pads[args.dst]
     path = plan(fixed, traces, start, goal, args.net,
                 args.cell_mm, args.clearance_mm, args.margin_mm,
-                dp_mult=args.dp_mult, max_hop_mm=args.max_hop_mm)
+                dp_mult=args.dp_mult, max_hop_mm=args.max_hop_mm,
+                penalties=penalties)
 
     if path is None:
         sys.stderr.write("coarse_planner: NO PATH — boxed by fixed geometry "

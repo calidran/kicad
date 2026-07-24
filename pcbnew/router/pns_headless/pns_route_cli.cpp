@@ -395,6 +395,8 @@ int main( int argc, char** argv )
     std::string boardPath, outPath, netName, fromRef, toRef, layerName, modeStr = "shove";
     std::string waypointStr;
     int iterLimit = 0;
+    int shoveIters = 20000;     // headless: no GUI latency budget to respect
+    int shoveMs = 20000;        // (stock 250 iters / 1000 ms is a UI guard)
     double widthMM = 0.0, clearanceMM = 0.0;
 
     std::vector<std::string> args( argv + 1, argv + argc );
@@ -413,6 +415,8 @@ int main( int argc, char** argv )
         else if( a == "--to" )        toRef = next();
         else if( a == "--layer" )     layerName = next();
         else if( a == "--iter-limit" ) iterLimit = std::stoi( next() );
+        else if( a == "--shove-iters" ) shoveIters = std::stoi( next() );
+        else if( a == "--shove-ms" )  shoveMs = std::stoi( next() );
         else if( a == "--width-mm" )  widthMM = std::stod( next() );
         else if( a == "--clearance-mm" ) clearanceMM = std::stod( next() );
         else if( a == "--mode" )      modeStr = next();
@@ -488,8 +492,13 @@ int main( int argc, char** argv )
     // Settings MUST be loaded before Settings() is touched (ctor leaves it null).
     PNS::ROUTING_SETTINGS settings( nullptr, "tools.pns" );
     settings.SetMode( modeStr == "walkaround" ? PNS::RM_Walkaround : PNS::RM_Shove );
+    // Foreign vias may shove (helps locally), but the routed net's own two
+    // escape vias are LOCKED below — PNS once displaced A7's goal via 0.26 mm
+    // mid-route so the trace "missed" its own endpoint.
     settings.SetShoveVias( true );
     settings.SetRemoveLoops( true );
+    settings.SetShoveIterationLimit( shoveIters );
+    settings.SetShoveTimeLimit( shoveMs );
     router.LoadSettings( &settings );
 
     router.SetMode( PNS::PNS_MODE_ROUTE_SINGLE );
@@ -529,12 +538,19 @@ int main( int argc, char** argv )
 
     // Anchor the endpoints to the actual resolved item centres (the inner-layer
     // escape vias), not the F.Cu pad XY, so the route starts and finishes on the
-    // net's inner-layer copper.
+    // net's inner-layer copper. Lock those vias so shove cannot displace our own
+    // endpoints out from under the route.
     if( startItem->OfKind( PNS::ITEM::VIA_T ) )
+    {
         startPos = startItem->Shape( -1 )->Centre();
+        startItem->Mark( startItem->Marker() | PNS::MK_LOCKED );
+    }
 
     if( endItem && endItem->OfKind( PNS::ITEM::VIA_T ) )
+    {
         endPos = endItem->Shape( -1 )->Centre();
+        endItem->Mark( endItem->Marker() | PNS::MK_LOCKED );
+    }
 
     // --- Build the hop list: waypoints (mm, board coords) then the target ---
     // The interactive engine places one "head" toward the cursor; a single

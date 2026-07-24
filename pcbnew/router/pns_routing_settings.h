@@ -131,6 +131,12 @@ public:
     int ShoveIterationLimit() const;
     TIME_LIMIT ShoveTimeLimit() const;
 
+    // headless-pns: the default shove budget (250 iters / 1000 ms) is a GUI
+    // responsiveness guard — shove runs between mouse events. Headless drivers
+    // can afford far larger budgets to push through congested regions.
+    void SetShoveIterationLimit( int aLimit ) { m_shoveIterationLimit = aLimit; }
+    void SetShoveTimeLimit( int aMilliseconds ) { m_shoveTimeLimit.Set( aMilliseconds ); }
+
     int WalkaroundIterationLimit() const { return m_walkaroundIterationLimit; };
     TIME_LIMIT WalkaroundTimeLimit() const;
 
