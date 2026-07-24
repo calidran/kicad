@@ -226,3 +226,48 @@ does not yet orchestrate.
 ### Wrapping into the fleet
 Still premature to ship the `frroute`-style wrapper + `board-route` skill section — 2/10 is
 progress, not a solved escape. Wire in once rip-up/ordering lifts the close-count materially.
+
+
+---
+
+## FINAL RESULT (2026-07-24) — v3 negotiated rip-up: NET ZERO. Not board-ready.
+
+DRC-authoritative (`kicad-cli pcb drc` from this fork's build) on the CAL-702 board,
+10 walled In2 ADDR nets, cumulative:
+
+| driver | closed | broke | net |
+|---|---|---|---|
+| v1 naive point-to-point | 1 (A5) | 0 | +1 |
+| v2 waypoint-steered (coarse A* + shove) | 2 (A4, A5) | 0 | +2 |
+| **v3 negotiated rip-up (16-pass, persistent penalties)** | **2 (A4, A5)** | **2 (/SEMC_D6, /SEMC_RAS_B)** | **0** |
+
+v3 detail: unconnected 95 -> 95 (no net connectivity gain); violations 1848 -> 1603.
+It closed the two target ADDR nets but **ripped two already-routed SEMC nets and never
+restored them** — a data line and a control line left dangling on the memory bus.
+
+**Root cause of the v3 regression: rip-up is not transactional.** A human doing
+push-shove never leaves a ripped net open — they restore it or undo the whole attempt.
+The driver has no such invariant.
+
+### NEXT FIX (for whoever resumes this)
+Make every routing attempt **all-or-nothing**: close the target AND restore everything
+ripped, or roll the entire board back. Until that holds, the tool can damage a working
+bus and must not be run against a production board.
+
+### EVAL TO BEAT
+The 10-net In2 ADDR close-count above, DRC-verified, **with zero regressions**. Beating
+2/10 while breaking nets is not progress.
+
+### BLOCKERS TO FLEET USE (all three must clear before wiring this into agent tooling)
+1. **Board format** — this fork is off KiCad *master* and writes format `20260624`;
+   the production box runs KiCad 9.0.9 and **cannot read** boards this tool writes.
+   Needs a rebase onto the 9.0.x stable branch.
+2. **Non-transactional rip-up** — see above.
+3. **Build/distribution** — needs a full KiCad source build (~1300 objects); the
+   ~3.7 GB production box cannot build it. Binary must be built elsewhere and shipped.
+
+### STATUS
+Capability proven (headless PNS shove runs, writes DRC-valid copper) and banked.
+NOT wired into the fleet, deliberately. Findings are recorded where agents will hit
+this wall: the `board-route` skill in `calidran/hive` (PR #563) — that is the
+discoverable home; this file is the depth.
