@@ -306,52 +306,68 @@ static PAD* findPad( BOARD* aBoard, const wxString& aRef )
 // for a given board pad + position.  Prefer the exact parent->item map used by
 // KiCad's own headless PNS log player; fall back to a geometric hover query
 // (the headless equivalent of TOOL_BASE::pickSingleItem).
+//
+// For a BGA escape, the F.Cu pad drops to the target inner layer through an
+// escape VIA. The route on the inner layer must anchor to that via, not the
+// F.Cu pad — otherwise FixRoute "completes" near the pad XY without actually
+// joining the net's inner-layer copper. So we prefer, in order:
+//   1. the net's own VIA that reaches the target layer, nearest aWhere
+//   2. any of the net's copper on the target layer (track/arc), nearest aWhere
+//   3. the pad SOLID via FindItemByParent (fallback)
 static PNS::ITEM* pickItem( PNS::ROUTER* aRouter, HEADLESS_PNS_IFACE* aIface,
                             const BOARD_ITEM* aParent, const VECTOR2I& aWhere,
                             PNS::NET_HANDLE aNet, int aPnsLayer )
 {
+    PNS::ITEM*  bestVia = nullptr;
+    PNS::ITEM*  bestOnLayer = nullptr;
+    SEG::ecoord bestViaDist = VECTOR2I::ECOORD_MAX;
+    SEG::ecoord bestLayDist = VECTOR2I::ECOORD_MAX;
+
+    for( int slop : { 0, 300000, 600000 } )   // 0, ~0.3mm, ~0.6mm
+    {
+        PNS::ITEM_SET cand = aRouter->QueryHoverItems( aWhere, slop );
+
+        for( PNS::ITEM* item : cand.Items() )
+        {
+            if( aNet && item->Net() != aNet )
+                continue;
+
+            if( !item->Layers().Overlaps( aPnsLayer ) )
+                continue;
+
+            SEG::ecoord d = ( item->Shape( -1 )->Centre() - aWhere ).SquaredEuclideanNorm();
+
+            if( item->OfKind( PNS::ITEM::VIA_T ) && d < bestViaDist )
+            {
+                bestViaDist = d;
+                bestVia = item;
+            }
+            else if( item->OfKind( PNS::ITEM::SEGMENT_T | PNS::ITEM::ARC_T )
+                     && d < bestLayDist )
+            {
+                bestLayDist = d;
+                bestOnLayer = item;
+            }
+        }
+
+        if( bestVia || bestOnLayer )
+            break;
+    }
+
+    if( bestVia )
+        return bestVia;
+
+    if( bestOnLayer )
+        return bestOnLayer;
+
+    // Fallback: the pad solid itself.
     if( aParent )
     {
         if( PNS::ITEM* byParent = aRouter->GetWorld()->FindItemByParent( aParent ) )
             return byParent;
     }
 
-    PNS::ITEM*  best = nullptr;
-    SEG::ecoord bestDist = VECTOR2I::ECOORD_MAX;
-
-    for( int slop : { 0, 250000 } )   // 0, then ~0.25mm slop
-    {
-        PNS::ITEM_SET cand = aRouter->QueryHoverItems( aWhere, slop );
-
-        for( PNS::ITEM* item : cand.Items() )
-        {
-            if( !item->IsRoutable() )
-                continue;
-
-            if( !aIface->IsPNSCopperLayer( item->Layers().Start() ) )
-                continue;
-
-            if( aNet && item->Net() != aNet )
-                continue;
-
-            if( !item->Layers().Overlaps( aPnsLayer )
-                    && !item->OfKind( PNS::ITEM::VIA_T | PNS::ITEM::SOLID_T ) )
-                continue;
-
-            SEG::ecoord d = ( item->Shape( -1 )->Centre() - aWhere ).SquaredEuclideanNorm();
-
-            if( d < bestDist )
-            {
-                bestDist = d;
-                best = item;
-            }
-        }
-
-        if( best )
-            break;
-    }
-
-    return best;
+    return nullptr;
 }
 
 
@@ -511,6 +527,15 @@ int main( int argc, char** argv )
 
     PNS::ITEM* endItem = pickItem( &router, &iface, toPad, endPos, net, pnsLayer );
 
+    // Anchor the endpoints to the actual resolved item centres (the inner-layer
+    // escape vias), not the F.Cu pad XY, so the route starts and finishes on the
+    // net's inner-layer copper.
+    if( startItem->OfKind( PNS::ITEM::VIA_T ) )
+        startPos = startItem->Shape( -1 )->Centre();
+
+    if( endItem && endItem->OfKind( PNS::ITEM::VIA_T ) )
+        endPos = endItem->Shape( -1 )->Centre();
+
     // --- Build the hop list: waypoints (mm, board coords) then the target ---
     // The interactive engine places one "head" toward the cursor; a single
     // straight Move-to-target stalls against obstacles it can't shove past in
@@ -559,9 +584,15 @@ int main( int argc, char** argv )
     const int reachTol = std::max( 1, sizes.TrackWidth() );   // "arrived" tolerance
     int  totalMoves = 0;
     int  stalledHop = -1;                                     // -1 == none
+    int  skippedHops = 0;
+    int  hopsReached = 0;
     VECTOR2I stallPos;
-    bool allHopsReached = true;
+    bool targetReached = false;
 
+    // Walk the hop list. On a stall at hop h, skip ahead to h+1 and let PNS aim
+    // there — a single grid waypoint can land just inside copper, but the next
+    // one usually gives a clear line. Only when NO remaining waypoint (incl. the
+    // target) can be reached do we declare the head boxed in.
     for( size_t h = 0; h < hops.size() && router.RoutingInProgress(); ++h )
     {
         const VECTOR2I&   hop = hops[h];
@@ -569,8 +600,9 @@ int main( int argc, char** argv )
         PNS::ITEM*        hopEnd = isLast ? endItem : nullptr;
         bool              hopReached = false;
         VECTOR2I          lastHead;
+        bool              haveLast = false;
+        int               noProgress = 0;
 
-        // Advance the head toward this hop until it arrives or stops moving.
         for( int step = 0; step < 48 && router.RoutingInProgress(); ++step )
         {
             router.Move( hop, hopEnd );
@@ -583,45 +615,84 @@ int main( int argc, char** argv )
 
             VECTOR2I head = placer->CurrentEnd();
 
+            if( getenv( "PNS_DEBUG" ) )
+                fprintf( stderr, "    hop %zu step %d: move->(%.3f,%.3f) head=(%.3f,%.3f) added=%d\n",
+                         h, step, hop.x / 1e6, hop.y / 1e6, head.x / 1e6, head.y / 1e6, iface.Added() );
+
             if( ( head - hop ).EuclideanNorm() <= reachTol )
             {
                 hopReached = true;
                 break;
             }
 
-            // Detect a stuck head: no progress across two consecutive moves.
-            if( step > 0 && ( head - lastHead ).EuclideanNorm() <= reachTol )
-                break;
+            if( haveLast && ( head - lastHead ).EuclideanNorm() <= reachTol )
+            {
+                if( ++noProgress >= 2 )
+                    break;
+            }
+            else
+            {
+                noProgress = 0;
+            }
 
             lastHead = head;
+            haveLast = true;
         }
 
-        // Lock the leader up to this hop and keep routing (forceFinish only on
-        // the final hop so the whole trace commits to the destination pad).
-        if( router.RoutingInProgress() )
-            router.FixRoute( hop, hopEnd, /*forceFinish*/ isLast, /*forceCommit*/ isLast );
-
-        if( !hopReached )
+        if( hopReached )
         {
-            allHopsReached = false;
-            stalledHop = static_cast<int>( h );
-            stallPos = router.Placer() ? router.Placer()->CurrentEnd() : startPos;
-            break;
+            // Lock the leader up to this reached corner and keep routing
+            // (forceFinish only when this is the destination pad).
+            if( router.RoutingInProgress() )
+                router.FixRoute( hop, hopEnd, /*forceFinish*/ isLast, /*forceCommit*/ isLast );
+
+            hopsReached++;
+
+            if( isLast )
+                targetReached = true;
+        }
+        else
+        {
+            // Stalled reaching this waypoint. Remember the first stall for the
+            // diagnostic, then skip ahead (do NOT FixRoute a corner we didn't
+            // reach — that would lock a bad partial segment).
+            if( stalledHop < 0 )
+            {
+                stalledHop = static_cast<int>( h );
+                stallPos = router.Placer() ? router.Placer()->CurrentEnd() : startPos;
+            }
+
+            skippedHops++;
+
+            // If we just failed the final (target) hop, try one last forced
+            // finish from wherever the head is — sometimes the last pinch is
+            // within the router's own snap range.
+            if( isLast && router.RoutingInProgress() )
+            {
+                if( router.FixRoute( hop, hopEnd, /*forceFinish*/ true, /*forceCommit*/ true ) )
+                    targetReached = true;
+            }
         }
     }
 
-    bool reached = allHopsReached;
+    bool reached = targetReached;
 
     router.CommitRouting();
 
-    // Honest success gate: copper actually laid AND every hop (incl. target)
-    // reached. FixRoute alone can return true while placing nothing.
-    bool completed = reached && iface.Added() > 0;
+    // Honest success gate. FixRoute can snap-return true while placing almost
+    // nothing, and skip-ahead can walk to the target after skipping the whole
+    // corridor — both look "reached" but leave the two escape vias unjoined.
+    // Require: target reached, real copper laid, AND the head actually traversed
+    // most of the corridor (majority of waypoints reached, not skipped). This is
+    // a heuristic; DRC connectivity is the authoritative check downstream.
+    const size_t hopCount = hops.size();
+    const bool   traversed = ( hopsReached * 2 >= static_cast<int>( hopCount ) );
+    bool completed = reached && traversed && iface.Added() >= 2;
 
     printf( "pns-route: mode=%s net=%s from=%s to=%s layer=%s -> completed=%s "
-            "(reached=%s hops=%zu moves=%d added=%d removed=%d updated=%d)\n",
+            "(reached=%s traversed=%d/%zu moves=%d added=%d removed=%d updated=%d)\n",
             modeStr.c_str(), netName.c_str(), fromRef.c_str(), toRef.c_str(), layerName.c_str(),
-            completed ? "yes" : "no", reached ? "yes" : "no", hops.size(),
+            completed ? "yes" : "no", reached ? "yes" : "no", hopsReached, hopCount,
             totalMoves, iface.Added(), iface.Removed(), iface.Updated() );
 
     if( !completed )

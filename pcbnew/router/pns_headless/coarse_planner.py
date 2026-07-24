@@ -55,6 +55,20 @@ def net_name_map(txt):
     return dict((int(n), name) for n, name in re.findall(r'\(net (\d+) "([^"]*)"', txt))
 
 
+def item_net_name(block, num2name):
+    """Net name of an item block, handling both sexpr formats:
+       old: (net 46)  -> look up in num2name
+       new: (net "/SEMC_A4")  -> name directly
+    """
+    m = re.search(r'\(net "([^"]*)"\)', block)
+    if m:
+        return m.group(1)
+    m = re.search(r'\(net (\d+)\)', block)
+    if m:
+        return num2name.get(int(m.group(1)), "")
+    return ""
+
+
 # --------------------------------------------------------------------------
 # geometry extraction (mm, absolute board coords)
 # --------------------------------------------------------------------------
@@ -97,12 +111,11 @@ def extract(txt, layer, own_net=None):
         at = re.search(r'\(at ([\-\d.]+) ([\-\d.]+)', v)
         size = re.search(r'\(size ([\-\d.]+)', v)
         lyr = re.search(r'\(layers "([^"]+)" "([^"]+)"\)', v)
-        vn = re.search(r'\(net (\d+)\)', v)
         if not at or not size:
             continue
         if lyr and not span_covers(lyr.group(1), lyr.group(2)):
             continue
-        if own_net and vn and nets.get(int(vn.group(1)), "") == own_net:
+        if own_net and item_net_name(v, nets) == own_net:
             continue  # the net's own escape vias are endpoints, not obstacles
         x, y = float(at.group(1)), float(at.group(2))
         r = float(size.group(1)) / 2.0
@@ -113,12 +126,26 @@ def extract(txt, layer, own_net=None):
     # fixed pad copper is through-hole pads + any pad explicitly on this layer.
     for fp in brace_blocks(txt, 'footprint'):
         refm = re.search(r'\(property "Reference" "([^"]+)"', fp)
-        atm = re.search(r'\(at ([\-\d.]+) ([\-\d.]+)(?: ([\-\d.]+))?\)', fp)
-        if not refm or not atm:
+        if not refm:
             continue
         ref = refm.group(1)
-        fx, fy = float(atm.group(1)), float(atm.group(2))
-        frot = float(atm.group(3) or 0)
+
+        # Footprint origin: old format uses a top-level (at x y rot); the newer
+        # (20260624) format uses (transform (translate x y)(rotate r)). Support
+        # both — the (at ...) regex must NOT accidentally match a pad's own (at).
+        trm = re.search(r'\(transform\s*\(translate ([\-\d.]+) ([\-\d.]+)\)\s*\(rotate ([\-\d.]+)\)', fp)
+        if trm:
+            fx, fy, frot = float(trm.group(1)), float(trm.group(2)), float(trm.group(3))
+        else:
+            # take the FIRST (at ...) that is a direct child of the footprint,
+            # i.e. appears before the first (pad ...)
+            first_pad = fp.find('(pad ')
+            head = fp[:first_pad] if first_pad >= 0 else fp
+            atm = re.search(r'\(at ([\-\d.]+) ([\-\d.]+)(?: ([\-\d.]+))?\)', head)
+            if not atm:
+                continue
+            fx, fy = float(atm.group(1)), float(atm.group(2))
+            frot = float(atm.group(3) or 0)
 
         for pm in re.finditer(
                 r'\(pad "([^"]+)"\s+(\S+)\s+(\S+)[\s\S]*?\(at ([\-\d.]+) ([\-\d.]+)(?: ([\-\d.]+))?\)'
@@ -148,13 +175,12 @@ def extract(txt, layer, own_net=None):
         s = re.search(r'\(start ([\-\d.]+) ([\-\d.]+)\)', seg)
         e = re.search(r'\(end ([\-\d.]+) ([\-\d.]+)\)', seg)
         w = re.search(r'\(width ([\-\d.]+)\)', seg)
-        n = re.search(r'\(net (\d+)\)', seg)
         if not (s and e):
             continue
         traces.append((float(s.group(1)), float(s.group(2)),
                        float(e.group(1)), float(e.group(2)),
                        float(w.group(1)) if w else 0.1,
-                       nets.get(int(n.group(1)), "") if n else ""))
+                       item_net_name(seg, nets)))
 
     return fixed, traces, pads
 
@@ -162,7 +188,8 @@ def extract(txt, layer, own_net=None):
 # --------------------------------------------------------------------------
 # grid A*
 # --------------------------------------------------------------------------
-def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm):
+def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm,
+         dp_mult=1.5, max_hop_mm=0.6):
     xs = [start[0], goal[0]] + [o[0] for o in fixed]
     ys = [start[1], goal[1]] + [o[1] for o in fixed]
     minx, maxx = min(xs) - margin_mm, max(xs) + margin_mm
@@ -267,7 +294,21 @@ def plan(fixed, traces, start, goal, net, cell_mm, clearance_mm, margin_mm):
             return left[:-1] + right
         return [points[0], points[-1]]
 
-    return dp(pts, eps=cell_mm * 1.5)
+    simp = dp(pts, eps=cell_mm * dp_mult)
+
+    # Resample so no hop exceeds max_hop_mm — PNS shoves one short segment per
+    # hop; a hop that is too long stalls the head partway against copper it
+    # can't shove in a single straight push.
+    dense = [simp[0]]
+    for i in range(1, len(simp)):
+        ax, ay = dense[-1]
+        bx, by = simp[i]
+        d = math.hypot(bx - ax, by - ay)
+        n = max(1, int(math.ceil(d / max_hop_mm)))
+        for k in range(1, n + 1):
+            t = k / n
+            dense.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    return dense
 
 
 def main():
@@ -280,6 +321,10 @@ def main():
     ap.add_argument('--cell-mm', type=float, default=0.2)
     ap.add_argument('--clearance-mm', type=float, default=0.15)
     ap.add_argument('--margin-mm', type=float, default=1.0)
+    ap.add_argument('--dp-mult', type=float, default=1.5,
+                    help='Douglas-Peucker epsilon = cell_mm * dp_mult (lower = more corners)')
+    ap.add_argument('--max-hop-mm', type=float, default=0.6,
+                    help='resample so no waypoint hop is longer than this')
     ap.add_argument('--emit', choices=['waypoints', 'debug'], default='waypoints')
     args = ap.parse_args()
 
@@ -292,7 +337,8 @@ def main():
 
     start, goal = pads[args.src], pads[args.dst]
     path = plan(fixed, traces, start, goal, args.net,
-                args.cell_mm, args.clearance_mm, args.margin_mm)
+                args.cell_mm, args.clearance_mm, args.margin_mm,
+                dp_mult=args.dp_mult, max_hop_mm=args.max_hop_mm)
 
     if path is None:
         sys.stderr.write("coarse_planner: NO PATH — boxed by fixed geometry "
