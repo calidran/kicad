@@ -170,15 +170,59 @@ never extends). That matches the geometry review's open question: the hardest ba
 gated by the **fixed via field**, not shoveable copper, so shove can't rescue them — In7
 is the real fix there.
 
-### What's left (the gap between "runs" and "beats the wall")
-A naive point-to-point `StartRouting→Move(target)→FixRoute` only completes nets threadable
-in a single straight shot. The GUI user makes **intermediate waypoint moves** to steer the
-head around obstacles; the CLI needs the same. Next iteration: (a) waypoint/auto-finish
-steering (feed the router a path of intermediate points, or use `Finish()`/
-`GetNearestRatnestAnchor`), (b) multi-layer escapes (via + layer change), (c) try the
-partial-copper nets with steering before concluding they're via-gated. The capability
-(headless shove that writes DRC-valid copper) is proven; the driving policy needs work.
+## v2 — two-layer waypoint driver (coarse planner + PNS shove)
+
+The naive point-to-point driver stalled its head against obstacles (reached=no on 9/10).
+v2 adds the two-layer architecture the coordinator specified:
+
+**1. Coarse global planner — `coarse_planner.py`.** Grid A* over the target layer.
+THE CRITICAL RULE: only FIXED copper is an obstacle — vias (filtered by their actual
+layer span, so a blind via that stops above In2 does not block In2) and through/on-layer
+pads, inflated by clearance. MOVEABLE traces are PASSABLE with a mild shove cost (foreign
+trace overlap adds A* cost but never blocks) — because PNS shoves them. The net's OWN
+escape vias are excluded (they are the endpoints). Emits a Douglas-Peucker-simplified,
+max-hop-resampled waypoint polyline. Handles BOTH sexpr formats (the box's 20241229 and
+the master fork's 20260624 that pns-route writes: `(transform (translate)(rotate))` not
+`(at)`, `(net "name")` not `(net N)`) — a silent mis-parse here corrupted every cumulative
+hop until fixed.
+
+**2. `pns-route --waypoints "x,y;..."`.** Endpoints resolve to the net's inner-layer escape
+VIA (not the F.Cu pad) so the route anchors to real inner-layer copper. Drives the head
+hop-by-hop: Move to settle, FixRoute(corner) to lock and continue, skip-ahead on a stalled
+waypoint, forced finish at the target. Per-hop instrumentation: `traversed=N/M` and
+`STALLED at hop k/M`.
+
+### Validation on CAL-702 In2 walled nets (DRC-authoritative, local kicad-cli)
+Baseline (naive v1): **1/10** closed (A5).
+**v2 two-layer driver: 2/10 close DRC-clean (A1, A4); clearance 499→499 (no new shorts).**
+Best config: deepest-first, planner clr 0.1 mm, cell 0.06 mm, max-hop 0.4 mm.
+
+Per-net diagnosis (the point of the instrumentation):
+- **Every one of the 10 nets gets a coarse PATH** from the planner at clr 0.1 mm — so NONE
+  is purely fixed-geometry-boxed at that clearance. The corridors through the shoveable
+  copper exist.
+- The 8 that don't close **stall at a mid-corridor congestion lock**: PNS shoves a burst of
+  neighbours (removed/updated counts climb) then wedges at a pinch where it cannot displace
+  enough traces *simultaneously*. This is a limit of the shove engine at this congestion
+  density, not a bad coarse path and not fixed geometry.
+- Ordering matters as predicted: deepest-first vs easiest-first close different nets, and
+  the first routed net hoards channel width (raising clr makes early nets "eat" corridors
+  later ones need). Neither ordering beat 2 DRC-real closes.
+
+Honesty notes (bugs caught by insisting on DRC over self-report): the driver's
+`completed=yes` self-report and a shell net-name substring check each produced false
+positives (8/10 and 10/10 respectively) that DRC connectivity flatly disproved. The
+trustworthy number is DRC unconnected-item delta: **2**.
+
+### What's left
+The remaining 8 need one of: (a) sequential-shove / rip-up-and-retry so a pinch is cleared
+across multiple attempts rather than one simultaneous shove; (b) a congestion-aware net
+ordering + width/gap budgeting so early nets don't hoard the channel; (c) multi-layer
+escapes (drop to In-other for the crossing). The two-layer capability — coarse-plan
+through moveable copper, PNS shoves along it, DRC-valid result — is proven and doubled the
+close-count; beating the wall wholesale needs rip-up, which PNS exposes but this driver
+does not yet orchestrate.
 
 ### Wrapping into the fleet
-Once completion improves: ship a `pns-route` wrapper mirroring `frroute` and add a
-`board-route` skill section. Not done yet — premature until the driver closes more than 1/10.
+Still premature to ship the `frroute`-style wrapper + `board-route` skill section — 2/10 is
+progress, not a solved escape. Wire in once rip-up/ordering lifts the close-count materially.
