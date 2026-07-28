@@ -489,7 +489,7 @@ int main( int argc, char** argv )
         return 1;
     }
 
-    SETTINGS_MANAGER settingsMgr( true /* headless */ );
+    SETTINGS_MANAGER settingsMgr;  // ctor takes no arg (matches qa/tools/pns pattern)
 
     if( !settingsMgr.LoadProject( projFn.GetFullPath() ) )
     {
