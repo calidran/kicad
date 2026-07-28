@@ -6,6 +6,13 @@ endif()
 
 add_compile_definitions( PCBNEW )
 
+# The self-registering PCB_IO importer backends. Declared here (before the router
+# subdirectory) so the optional headless `pns-route` target can link them — its
+# target_link_libraries expands ${PCBNEW_IO_LIBRARIES} at parse time, which happens
+# during add_subdirectory(router) below. These are target NAMES (resolved at link
+# time), so listing them before the targets exist is fine.
+set( PCBNEW_IO_LIBRARIES pcad2kicadpcb allegro2pcbnew altium2pcbnew cadstar2pcbnew easyeda easyedapro fabmaster ipc2581 odbpp pads2pcbnew sprint_layout2pcbnew diptrace2pcbnew autotrax2pcbnew CACHE INTERNAL "")
+
 add_subdirectory(connectivity)
 
 add_subdirectory(router)
@@ -670,7 +677,8 @@ add_subdirectory( pcb_io/sprint_layout )
 add_subdirectory( pcb_io/diptrace )
 add_subdirectory( pcb_io/autotrax )
 
-set( PCBNEW_IO_LIBRARIES pcad2kicadpcb allegro2pcbnew altium2pcbnew cadstar2pcbnew easyeda easyedapro fabmaster ipc2581 odbpp pads2pcbnew sprint_layout2pcbnew diptrace2pcbnew autotrax2pcbnew CACHE INTERNAL "")
+# PCBNEW_IO_LIBRARIES is now set near the top of this file (before add_subdirectory(router))
+# so the headless pns-route target can link it; see the note there.
 
 #a very small program launcher for pcbnew_kiface
 add_executable( pcbnew WIN32 MACOSX_BUNDLE

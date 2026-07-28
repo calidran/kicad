@@ -41,6 +41,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import coarse_planner as cp
+import tx_guard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -237,6 +238,10 @@ def main():
                     help='lock-in mode: keep the board across passes; closed '
                          'nets stay routed, only unresolved nets re-route '
                          '(targeted blocker rip-up still allowed)')
+    ap.add_argument('--kicad-cli', default=None,
+                    help='path to the fork kicad-cli; enables the authoritative '
+                         'DRC dominance gate on adoption (no board is adopted '
+                         'unless it closes more targets AND breaks no net)')
     args = ap.parse_args()
 
     binary = args.binary or os.path.join(HERE, '..', '..', '..', 'build',
@@ -288,8 +293,29 @@ def main():
                     best_d, best_pt = d, (px, py)
         return best_pt
 
+    def route_tx(net, frm, to, wps, ripped=()):
+        """Run pns-route as a TRANSACTION. Snapshot the board, route, then check
+        whether the shove severed any *other* net on this layer (component count
+        rose). If so, roll the board back and report the step rejected. `ripped`
+        = nets we intentionally removed this step (exempt, we re-route them). This
+        is the fix for the v3 regression: a shove that closes the target but snaps
+        a neighbour is undone instead of committed. Returns (accepted, stall, txt)."""
+        snap = open(work).read()
+        pre = tx_guard.layer_components(snap, layer)
+        _out, stall = run_pns_route(binary, work, net, frm, to, layer, wps, env)
+        txt = open(work).read()
+        bad = tx_guard.regressed_nets(pre, tx_guard.layer_components(txt, layer),
+                                      exempt={net, *ripped})
+        if bad:
+            open(work, 'w').write(snap)        # undo the damaging shove
+            return False, stall, snap, bad
+        return True, stall, txt, []
+
     order = list(nets.keys())
     persistent_routed = set()
+
+    # authoritative baseline for the DRC dominance gate (optional)
+    base_drc = tx_guard.drc_metrics(args.board, args.kicad_cli) if args.kicad_cli else None
 
     open(work, 'w').write(pristine)
 
@@ -318,8 +344,11 @@ def main():
                 log.append(f"[pass {pss}] {net}: planner NO PATH")
                 continue
 
-            out, stall = run_pns_route(binary, work, net, frm, to, layer, wps, env)
-            txt = open(work).read()
+            accepted, stall, txt, bad = route_tx(net, frm, to, wps)
+            if not accepted:
+                fail_hist[net] += 1
+                log.append(f"[pass {pss}] {net}: shove REJECTED (would sever {bad})")
+                continue
 
             if is_connected(txt, net, layer):
                 routed.add(net)
@@ -374,10 +403,9 @@ def main():
                     wps2 = run_planner(work, net, frm, to, layer, args.cell_mm,
                                        args.clearance_mm, penalty_file)
                     if wps2:
-                        out, stall2 = run_pns_route(binary, work, net, frm, to,
-                                                    layer, wps2, env)
-                        txt = open(work).read()
-                        if is_connected(txt, net, layer):
+                        acc2, stall2, txt, _bad2 = route_tx(net, frm, to, wps2,
+                                                            ripped={b})
+                        if acc2 and is_connected(txt, net, layer):
                             routed.add(net)
                         else:
                             txt, _ = rip_net(txt, net, layer)
@@ -390,10 +418,9 @@ def main():
                                        args.cell_mm, args.clearance_mm,
                                        penalty_file)
                     if wpsb:
-                        run_pns_route(binary, work, b, nets[b][0], nets[b][1],
-                                      layer, wpsb, env)
-                        txt = open(work).read()
-                        if is_connected(txt, b, layer):
+                        accb, _sb, txt, _badb = route_tx(b, nets[b][0], nets[b][1],
+                                                         wpsb)
+                        if accb and is_connected(txt, b, layer):
                             routed.add(b)
                         else:
                             txt, _ = rip_net(txt, b, layer)
@@ -420,7 +447,23 @@ def main():
             persistent_routed = set(routed)
 
         if len(routed) > best[0]:
-            best = (len(routed), open(work).read(), closed)
+            cand = open(work).read()
+            adopt = True
+            if args.kicad_cli and base_drc is not None:
+                m = tx_guard.drc_metrics(work, args.kicad_cli)
+                if m is not None:
+                    # authoritative backstop: the inner guard already forbids
+                    # severing a net; DRC additionally forbids new shorts and any
+                    # rise in unconnected items. A board is adopted only if it
+                    # dominates the baseline.
+                    adopt = (m['unconnected'] <= base_drc['unconnected']
+                             and m['gating'] <= base_drc['gating'])
+                    log.append(f"[pass {pss}] DRC gate: unconn {m['unconnected']}"
+                               f"/{base_drc['unconnected']} gating {m['gating']}"
+                               f"/{base_drc['gating']} -> "
+                               f"{'ADOPT' if adopt else 'REJECT'}")
+            if adopt:
+                best = (len(routed), cand, closed)
 
         if len(routed) == len(nets):
             break
