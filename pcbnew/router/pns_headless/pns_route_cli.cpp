@@ -56,6 +56,13 @@
 #include <settings/settings_manager.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 
+// DRC engine + project — REQUIRED for a live clearance resolver (see below).
+#include <project.h>
+#include <project/project_local_settings.h>
+#include <drc/drc_engine.h>
+#include <drc/drc_rule.h>
+#include <wildcards_and_files_ext.h>
+
 #include <router/pns_router.h>
 #include <router/pns_kicad_iface.h>
 #include <router/pns_routing_settings.h>
@@ -459,6 +466,83 @@ int main( int argc, char** argv )
     board->BuildListOfNets();
     board->BuildConnectivity();
 
+    // --- Initialise the DRC engine (MANDATORY) --------------------------
+    // PCB_IO::LoadBoard() does NOT initialise the DRC engine, and it does NOT
+    // load the .kicad_pro (netclasses live in the project, not the .kicad_pcb).
+    // With a null engine PNS_PCBNEW_RULE_RESOLVER::QueryConstraint returns false
+    // and Clearance() falls back to its `int rv = 0` initialiser: the router
+    // then lays copper at 0.00000 mm from foreign nets and reports success.
+    // Mirror BOARD_LOADER::initializeLoadedBoard / qa pns_log_file.cpp so the
+    // resolver PNS queries is the REAL board+DRU resolver. Fail loud if the
+    // project is missing — routing blind is never acceptable.
+    wxFileName projFn( wxString::FromUTF8( boardPath ) );
+    projFn.SetExt( FILEEXT::ProjectFileExtension );
+
+    if( !projFn.FileExists() )
+    {
+        fprintf( stderr,
+                 "pns-route: FATAL: project file '%s' not found next to the board.\n"
+                 "  Netclasses/clearances come from the .kicad_pro; without it the DRC\n"
+                 "  engine has no rules and PNS would route at 0.00 mm clearance.\n"
+                 "  Refusing to route blind.\n",
+                 projFn.GetFullPath().ToUTF8().data() );
+        return 1;
+    }
+
+    SETTINGS_MANAGER settingsMgr( true /* headless */ );
+
+    if( !settingsMgr.LoadProject( projFn.GetFullPath() ) )
+    {
+        fprintf( stderr, "pns-route: FATAL: failed to load project '%s'\n",
+                 projFn.GetFullPath().ToUTF8().data() );
+        return 1;
+    }
+
+    PROJECT* project = settingsMgr.GetProject( projFn.GetFullPath() );
+
+    if( !project )
+    {
+        fprintf( stderr, "pns-route: FATAL: GetProject returned null for '%s'\n",
+                 projFn.GetFullPath().ToUTF8().data() );
+        return 1;
+    }
+
+    // Read-only so SaveProject can never rewrite the user's .kicad_pro.
+    project->SetReadOnly();
+    board->SetProject( project );
+
+    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    std::shared_ptr<DRC_ENGINE> drcEngine = std::make_shared<DRC_ENGINE>();
+    bds.m_DRCEngine = drcEngine;
+    bds.m_UseConnectedTrackWidth = project->GetLocalSettings().m_AutoTrackWidth;
+
+    board->SynchronizeNetsAndNetClasses( true );
+
+    drcEngine->SetBoard( board );
+    drcEngine->SetDesignSettings( &bds );
+
+    // DRU rules sit next to the board as <board>.kicad_dru (optional — the
+    // netclass clearances from the project still apply without it).
+    wxFileName druFn( wxString::FromUTF8( boardPath ) );
+    druFn.SetExt( FILEEXT::DesignRulesFileExtension );
+
+    try
+    {
+        if( druFn.FileExists() )
+            drcEngine->InitEngine( druFn );
+        else
+            drcEngine->InitEngine( wxFileName() );
+    }
+    catch( const std::exception& e )
+    {
+        fprintf( stderr, "pns-route: FATAL: DRC InitEngine failed: %s\n", e.what() );
+        return 1;
+    }
+
+    fprintf( stderr, "pns-route: DRC engine initialised (project='%s' dru=%s)\n",
+             projFn.GetFullName().ToUTF8().data(),
+             druFn.FileExists() ? druFn.GetFullName().ToUTF8().data() : "(none)" );
+
     // --- Resolve endpoints ----------------------------------------------
     PAD* fromPad = findPad( board, wxString::FromUTF8( fromRef ) );
     PAD* toPad   = findPad( board, wxString::FromUTF8( toRef ) );
@@ -482,6 +566,54 @@ int main( int argc, char** argv )
         fprintf( stderr, "pns-route: warning: --from pad net '%s' != --net '%s'\n",
                  net->GetNetname().ToUTF8().data(), netName.c_str() );
 
+    // --- CLEARANCE_PROBE: prove the engine is live ----------------------
+    // Ask the SAME resolver PNS uses for the electrical clearance between the
+    // routed net's start pad and a real FOREIGN pad on the route layer. A null
+    // engine returns 0; a live engine returns the netclass/DRU rule (~0.1 mm on
+    // this board). This is the smoking-gun the previous blind builds lacked.
+    {
+        PAD* foreignPad = nullptr;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            for( PAD* p : fp->Pads() )
+            {
+                if( p->GetNetCode() != fromPad->GetNetCode() && p->GetNetCode() > 0
+                    && p->IsOnLayer( layer ) )
+                {
+                    foreignPad = p;
+                    break;
+                }
+            }
+
+            if( foreignPad )
+                break;
+        }
+
+        if( foreignPad )
+        {
+            DRC_CONSTRAINT c = bds.m_DRCEngine->EvalRules( CLEARANCE_CONSTRAINT,
+                                                           fromPad, foreignPad, layer );
+            double mm = c.GetValue().HasMin() ? c.GetValue().Min() / 1e6 : -1.0;
+            fprintf( stderr,
+                     "CLEARANCE_PROBE=%.5f mm  (net='%s' pad=%s.%s vs foreign net='%s' "
+                     "pad=%s.%s on %s)\n",
+                     mm,
+                     net ? net->GetNetname().ToUTF8().data() : "?",
+                     fromPad->GetParentFootprint()->GetReference().ToUTF8().data(),
+                     fromPad->GetNumber().ToUTF8().data(),
+                     foreignPad->GetNet() ? foreignPad->GetNet()->GetNetname().ToUTF8().data() : "?",
+                     foreignPad->GetParentFootprint()->GetReference().ToUTF8().data(),
+                     foreignPad->GetNumber().ToUTF8().data(),
+                     layerName.c_str() );
+        }
+        else
+        {
+            fprintf( stderr, "CLEARANCE_PROBE=n/a (no foreign pad on layer %s)\n",
+                     layerName.c_str() );
+        }
+    }
+
     // --- Wire up the headless router ------------------------------------
     HEADLESS_PNS_IFACE iface;
     iface.SetBoard( board );
@@ -492,10 +624,13 @@ int main( int argc, char** argv )
     // Settings MUST be loaded before Settings() is touched (ctor leaves it null).
     PNS::ROUTING_SETTINGS settings( nullptr, "tools.pns" );
     settings.SetMode( modeStr == "walkaround" ? PNS::RM_Walkaround : PNS::RM_Shove );
-    // Foreign vias may shove (helps locally), but the routed net's own two
-    // escape vias are LOCKED below — PNS once displaced A7's goal via 0.26 mm
-    // mid-route so the trace "missed" its own endpoint.
-    settings.SetShoveVias( true );
+    // NEVER shove vias. SHOVE::onCollidingVia skips a via only if ShoveVias()
+    // is false OR the via IsLocked(); locking just our own endpoints leaves
+    // every FOREIGN escape via shoveable, and routing one net has moved a
+    // neighbour's via-in-pad 0.100 mm off its ball centre (12 manufactured
+    // shorts). SetShoveVias(false) is the reliable lever — the lock guard can
+    // be bypassed by a zero-force livelock bail before it is reached.
+    settings.SetShoveVias( false );
     settings.SetRemoveLoops( true );
     settings.SetShoveIterationLimit( shoveIters );
     settings.SetShoveTimeLimit( shoveMs );
