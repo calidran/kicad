@@ -183,7 +183,11 @@ def regressed_nets(base_comp, cur_comp, exempt=()):
 
 def drc_metrics(board_path, kicad_cli, gate_types=None):
     """Authoritative connectivity/violation counts via the fork's kicad-cli.
-    Returns {'unconnected': int, 'gating': int, 'violations': int} or None on failure."""
+    Returns {'unconnected': int, 'gating': int, 'violations': int,
+             'unconnected_nets': set(net names with >=1 unconnected item)}
+    or None on failure. `unconnected_nets` is what a PER-NET regression gate needs:
+    a net that is fully connected before a change must not appear here after it
+    (aggregate counts can mask a break when target closes outnumber the break)."""
     import json
     import tempfile
     gate_types = gate_types or {'shorting_items', 'clearance',
@@ -191,19 +195,26 @@ def drc_metrics(board_path, kicad_cli, gate_types=None):
     with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tf:
         out = tf.name
     try:
-        r = subprocess.run([kicad_cli, 'pcb', 'drc', '--format', 'json',
-                            '--output', out, board_path],
-                           capture_output=True, text=True)
+        subprocess.run([kicad_cli, 'pcb', 'drc', '--format', 'json',
+                        '--output', out, board_path],
+                       capture_output=True, text=True)
         if not os.path.exists(out) or os.path.getsize(out) == 0:
             return None
-        d = json.load(open(out))
+        d = json.load(out and open(out))
         V = d.get('violations', [])
         from collections import Counter
         c = Counter(v['type'] for v in V)
-        unconn = len(d.get('unconnected_items', []))
-        return {'unconnected': unconn,
+        ui = d.get('unconnected_items', [])
+        unconn_nets = set()
+        for it in ui:
+            for sub in it.get('items', []):
+                m = re.search(r'\[([^\]]+)\]', sub.get('description', ''))
+                if m:
+                    unconn_nets.add(m.group(1))
+        return {'unconnected': len(ui),
                 'gating': sum(c[t] for t in gate_types),
-                'violations': len(V)}
+                'violations': len(V),
+                'unconnected_nets': unconn_nets}
     finally:
         if os.path.exists(out):
             os.remove(out)

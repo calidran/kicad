@@ -452,15 +452,13 @@ def main():
             if args.kicad_cli and base_drc is not None:
                 m = tx_guard.drc_metrics(work, args.kicad_cli)
                 if m is not None:
-                    # authoritative backstop: the inner guard already forbids
-                    # severing a net; DRC additionally forbids new shorts and any
-                    # rise in unconnected items. A board is adopted only if it
-                    # dominates the baseline.
-                    adopt = (m['unconnected'] <= base_drc['unconnected']
-                             and m['gating'] <= base_drc['gating'])
-                    log.append(f"[pass {pss}] DRC gate: unconn {m['unconnected']}"
-                               f"/{base_drc['unconnected']} gating {m['gating']}"
-                               f"/{base_drc['gating']} -> "
+                    # authoritative PER-NET backstop: no net that was connected in
+                    # the baseline may become unconnected (aggregate counts mask a
+                    # break when target closes outnumber it), and no new shorts.
+                    new_broken = m['unconnected_nets'] - base_drc['unconnected_nets']
+                    adopt = (not new_broken and m['gating'] <= base_drc['gating'])
+                    log.append(f"[pass {pss}] DRC gate: broke={sorted(new_broken)} "
+                               f"gating {m['gating']}/{base_drc['gating']} -> "
                                f"{'ADOPT' if adopt else 'REJECT'}")
             if adopt:
                 best = (len(routed), cand, closed)
